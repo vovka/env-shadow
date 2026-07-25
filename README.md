@@ -58,6 +58,19 @@ The wrappers intercept these filename forms:
 
 Other files still go directly to the real `cat` or `less`. To redact another filename explicitly, use `env-shadow path/to/file`.
 
+## VS Code extension
+
+The [`vscode-extension`](./vscode-extension) package applies compatible masking rules inside VS Code without changing the document. It supports global, per-file, and per-secret reveal controls, configurable visible character counts, and multiline values.
+
+```bash
+cd vscode-extension
+npm test
+npm install
+npm run package
+```
+
+Open the package in VS Code and press **F5** to test it in an Extension Development Host.
+
 ## CLI
 
 ```console

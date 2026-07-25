@@ -1,0 +1,30 @@
+name: VS Code extension CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "vscode-extension/**"
+      - ".github/workflows/vscode-extension-ci.yml"
+  pull_request:
+    paths:
+      - "vscode-extension/**"
+      - ".github/workflows/vscode-extension-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+        working-directory: vscode-extension
+      - run: npm test
+        working-directory: vscode-extension
+      - run: npm run package
+        working-directory: vscode-extension

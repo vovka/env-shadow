@@ -1,0 +1,145 @@
+{
+  "name": "env-shadow",
+  "displayName": "Env Shadow",
+  "description": "Visually mask secrets in .env files using env-shadow-compatible labels and key-name detection.",
+  "version": "0.1.0",
+  "publisher": "vovka",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vovka/env-shadow.git",
+    "directory": "vscode-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/vovka/env-shadow/issues"
+  },
+  "homepage": "https://github.com/vovka/env-shadow/tree/main/vscode-extension#readme",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "dotenv",
+    "env",
+    "secrets",
+    "password",
+    "mask",
+    "redact",
+    "security"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./src/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "envShadow.toggleMasking",
+        "title": "Env Shadow: Toggle Masking"
+      },
+      {
+        "command": "envShadow.toggleCurrentFile",
+        "title": "Env Shadow: Toggle Current File"
+      },
+      {
+        "command": "envShadow.toggleSecretAtCursor",
+        "title": "Env Shadow: Toggle Secret Under Cursor"
+      },
+      {
+        "command": "envShadow.hideAll",
+        "title": "Env Shadow: Hide All Secrets"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "envShadow.toggleCurrentFile",
+          "when": "resourceFilename =~ /(^\\.env($|\\.)|.+\\.env($|\\.))/",
+          "group": "navigation@90"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "envShadow.toggleSecretAtCursor",
+          "when": "resourceFilename =~ /(^\\.env($|\\.)|.+\\.env($|\\.))/",
+          "group": "navigation@90"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Env Shadow",
+      "properties": {
+        "envShadow.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable visual secret masking when the extension starts."
+        },
+        "envShadow.autoDetect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically mask assignments whose variable names look secret."
+        },
+        "envShadow.keepStart": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3,
+          "description": "Number of characters to leave visible at the beginning of a secret."
+        },
+        "envShadow.keepEnd": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3,
+          "description": "Number of characters to leave visible at the end of a secret."
+        },
+        "envShadow.labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "secret",
+            "shadow",
+            "blur"
+          ],
+          "description": "Final inline-comment labels that force masking."
+        },
+        "envShadow.publicLabels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "public",
+            "reveal",
+            "visible"
+          ],
+          "description": "Final inline-comment labels that override automatic masking."
+        },
+        "envShadow.keyPattern": {
+          "type": "string",
+          "default": "((^|_)(PASSWORD|PASSWD|PASSPHRASE|TOKEN|SECRET|API_KEY|ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET|AUTH_KEY|CREDENTIALS?)($|_))|^(DATABASE_URL|REDIS_URL|MONGODB_URI|AMQP_URL|BROKER_URL|SENTRY_DSN)$",
+          "description": "Case-insensitive JavaScript regular expression used for automatic variable-name detection."
+        },
+        "envShadow.filePattern": {
+          "type": "string",
+          "default": "(^|/)(\\.env($|\\.)|[^/]+\\.env($|\\.))",
+          "description": "Case-insensitive JavaScript regular expression selecting files to mask."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.9.2"
+  }
+}
