@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+VERSION="0.1.0"
+KEEP="${ENV_SHADOW_KEEP:-3}"
+MASK="${ENV_SHADOW_MASK:-...}"
+AUTO_DETECT="${ENV_SHADOW_AUTO:-1}"
+LABELS="${ENV_SHADOW_LABELS:-secret,shadow,blur}"
+PUBLIC_LABELS="${ENV_SHADOW_PUBLIC_LABELS:-public,reveal,visible}"
+KEY_REGEX="${ENV_SHADOW_KEY_REGEX:-((^|_)(PASSWORD|PASSWD|PASSPHRASE|TOKEN|SECRET|API_KEY|ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET|AUTH_KEY|CREDENTIALS?)($|_))|^(DATABASE_URL|REDIS_URL|MONGODB_URI|AMQP_URL|BROKER_URL|SENTRY_DSN)$}"
+
+usage() {
+  cat <<'USAGE'
+Usage: env-shadow [options] [file ...]
+
+Redact marked or automatically detected secrets in dotenv-style assignments.
+Reads standard input when no file is provided or when file is '-'.
+
+Options:
+  -k, --keep N          Keep N characters at both ends (default: 3)
+  -m, --mask TEXT       Text used between visible ends (default: ...)
+      --labels LIST     Comma-separated redaction labels
+      --public-labels L Comma-separated opt-out labels
+      --key-regex REGEX Bash regex used for automatic key detection
+      --no-auto         Disable automatic key-name detection
+      --auto            Enable automatic key-name detection (default)
+  -h, --help            Show this help
+  -v, --version         Show the version
+
+Examples:
+  PASSWORD=correct-horse-battery-staple # secret
+  API_TOKEN=ghp_1234567890abcdef
+  DEMO_PASSWORD=not-sensitive # public
+
+  env-shadow .env
+  env-shadow --keep 4 .env.production
+USAGE
+}
+
+die() {
+  printf 'env-shadow: %s\n' "$*" >&2
+  exit 2
+}
+
+is_nonnegative_integer() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+csv_has_label() {
+  local csv="$1" label="$2" item
+  local old_ifs="$IFS"
+  IFS=','
+  for item in $csv; do
+    item="${item#${item%%[![:space:]]*}}"
+    item="${item%${item##*[![:space:]]}}"
+    [[ "${item,,}" == "$label" ]] && { IFS="$old_ifs"; return 0; }
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+comment_last_label() {
+  local comment="$1" body label
+  body="${comment#*#}"
+  body="${body%$'\r'}"
+  body="${body%${body##*[![:space:]]}}"
+  label="${body##*[[:space:]]}"
+  label="${label,,}"
+  label="${label%,}"
+  label="${label%;}"
+  printf '%s' "$label"
+}
+
+parse_assignment() {
+  local line="$1"
+  if [[ "$line" =~ ^([[:space:]]*(export[[:space:]]+)?)([A-Za-z_][A-Za-z0-9_]*)([[:space:]]*=[[:space:]]*)(.*)$ ]]; then
+    ASSIGN_PREFIX="${BASH_REMATCH[1]}"
+    ASSIGN_KEY="${BASH_REMATCH[3]}"
+    ASSIGN_SEPARATOR="${BASH_REMATCH[4]}"
+    ASSIGN_REST="${BASH_REMATCH[5]}"
+    return 0
+  fi
+  return 1
+}
+
+split_value_comment() {
+  local input="$1" i char prev quote="" escaped=0
+  SPLIT_VALUE="$input"
+  SPLIT_COMMENT=""
+
+  for ((i = 0; i < ${#input}; i++)); do
+    char="${input:i:1}"
+
+    if ((escaped)); then
+      escaped=0
+      continue
+    fi
+
+    if [[ "$quote" == '"' ]]; then
+      if [[ "$char" == '\\' ]]; then
+        escaped=1
+      elif [[ "$char" == '"' ]]; then
+        quote=""
+      fi
+      continue
+    fi
+
+    if [[ "$quote" == "'" ]]; then
+      [[ "$char" == "'" ]] && quote=""
+      continue
+    fi
+
+    case "$char" in
+      '"') quote='"' ;;
+      "'") quote="'" ;;
+      '\\') escaped=1 ;;
+      '#')
+        if ((i == 0)); then
+          SPLIT_VALUE=""
+          SPLIT_COMMENT="$input"
+          return
+        fi
+        prev="${input:i-1:1}"
+        if [[ "$prev" == [[:space:]] ]]; then
+          SPLIT_VALUE="${input:0:i}"
+          SPLIT_COMMENT="${input:i}"
+          return
+        fi
+        ;;
+    esac
+  done
+}
+
+starts_multiline_value() {
+  local input="$1" stripped quote i char escaped=0
+  MULTILINE_LEADING="${input%%[![:space:]]*}"
+  stripped="${input#"$MULTILINE_LEADING"}"
+  ((${#stripped} > 0)) || return 1
+
+  quote="${stripped:0:1}"
+  [[ "$quote" == "'" || "$quote" == '"' ]] || return 1
+
+  for ((i = 1; i < ${#stripped}; i++)); do
+    char="${stripped:i:1}"
+    if [[ "$quote" == '"' ]]; then
+      if ((escaped)); then
+        escaped=0
+      elif [[ "$char" == '\\' ]]; then
+        escaped=1
+      elif [[ "$char" == '"' ]]; then
+        return 1
+      fi
+    elif [[ "$char" == "'" ]]; then
+      return 1
+    fi
+  done
+
+  MULTILINE_QUOTE="$quote"
+  return 0
+}
+
+find_multiline_close() {
+  local input="$1" quote="$2" i char escaped=0
+  MULTILINE_CLOSE_INDEX=-1
+
+  for ((i = 0; i < ${#input}; i++)); do
+    char="${input:i:1}"
+    if [[ "$quote" == '"' ]]; then
+      if ((escaped)); then
+        escaped=0
+      elif [[ "$char" == '\\' ]]; then
+        escaped=1
+      elif [[ "$char" == '"' ]]; then
+        MULTILINE_CLOSE_INDEX=$i
+        return 0
+      fi
+    elif [[ "$char" == "'" ]]; then
+      MULTILINE_CLOSE_INDEX=$i
+      return 0
+    fi
+  done
+  return 1
+}
+
+should_redact_assignment() {
+  local key="$1" comment="$2" label key_upper
+  label="$(comment_last_label "$comment")"
+  SHOULD_REDACT=0
+
+  if [[ -n "$label" ]] && csv_has_label "$PUBLIC_LABELS" "$label"; then
+    return
+  fi
+  if [[ -n "$label" ]] && csv_has_label "$LABELS" "$label"; then
+    SHOULD_REDACT=1
+    return
+  fi
+  if ((AUTO_DETECT)); then
+    key_upper="${key^^}"
+    [[ "$key_upper" =~ $KEY_REGEX ]] && SHOULD_REDACT=1
+  fi
+}
+
+repeat_char() {
+  local char="$1" count="$2" output="" i
+  for ((i = 0; i < count; i++)); do
+    output+="$char"
+  done
+  printf '%s' "$output"
+}
+
+redact_core() {
+  local value="$1" length=${#1}
+
+  if ((length == 0)); then
+    printf '%s' "$value"
+  elif ((KEEP == 0)); then
+    printf '%s' "$MASK"
+  elif ((length <= KEEP * 2)); then
+    repeat_char '*' "$length"
+  else
+    printf '%s%s%s' "${value:0:KEEP}" "$MASK" "${value:length-KEEP:KEEP}"
+  fi
+}
+
+redact_value() {
+  local input="$1" leading trailing core first last inner
+
+  leading="${input%%[![:space:]]*}"
+  core="${input#"$leading"}"
+  trailing="${core##*[![:space:]]}"
+  core="${core%"$trailing"}"
+
+  if ((${#core} >= 2)); then
+    first="${core:0:1}"
+    last="${core: -1}"
+    if { [[ "$first" == "'" && "$last" == "'" ]] || [[ "$first" == '"' && "$last" == '"' ]]; }; then
+      inner="${core:1:${#core}-2}"
+      printf '%s%s%s%s%s' "$leading" "$first" "$(redact_core "$inner")" "$last" "$trailing"
+      return
+    fi
+  fi
+
+  printf '%s%s%s' "$leading" "$(redact_core "$core")" "$trailing"
+}
+
+process_single_line() {
+  local line="$1"
+
+  if ! parse_assignment "$line"; then
+    printf '%s\n' "$line"
+    return
+  fi
+
+  split_value_comment "$ASSIGN_REST"
+  should_redact_assignment "$ASSIGN_KEY" "$SPLIT_COMMENT"
+
+  if ((SHOULD_REDACT)); then
+    printf '%s%s%s%s%s\n' \
+      "$ASSIGN_PREFIX" "$ASSIGN_KEY" "$ASSIGN_SEPARATOR" \
+      "$(redact_value "$SPLIT_VALUE")" "$SPLIT_COMMENT"
+  else
+    printf '%s\n' "$line"
+  fi
+}
+
+print_buffer() {
+  local item
+  for item in "$@"; do
+    printf '%s\n' "$item"
+  done
+}
+
+process_stream() {
+  local line suffix comment label
+  local in_multiline=0 multiline_quote="" multiline_prefix="" multiline_key=""
+  local multiline_separator="" multiline_leading=""
+  local -a buffer=()
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if ((in_multiline)); then
+      buffer+=("$line")
+      if find_multiline_close "$line" "$multiline_quote"; then
+        suffix="${line:MULTILINE_CLOSE_INDEX+1}"
+        split_value_comment "$suffix"
+        comment="$SPLIT_COMMENT"
+        should_redact_assignment "$multiline_key" "$comment"
+
+        if ((SHOULD_REDACT)); then
+          printf '%s%s%s%s%s<multiline secret hidden>%s%s\n' \
+            "$multiline_prefix" "$multiline_key" "$multiline_separator" \
+            "$multiline_leading" "$multiline_quote" "$multiline_quote" "$suffix"
+        else
+          print_buffer "${buffer[@]}"
+        fi
+
+        in_multiline=0
+        buffer=()
+      fi
+      continue
+    fi
+
+    if parse_assignment "$line" && starts_multiline_value "$ASSIGN_REST"; then
+      in_multiline=1
+      multiline_quote="$MULTILINE_QUOTE"
+      multiline_prefix="$ASSIGN_PREFIX"
+      multiline_key="$ASSIGN_KEY"
+      multiline_separator="$ASSIGN_SEPARATOR"
+      multiline_leading="$MULTILINE_LEADING"
+      buffer=("$line")
+      continue
+    fi
+
+    process_single_line "$line"
+  done
+
+  if ((in_multiline)); then
+    should_redact_assignment "$multiline_key" ""
+    if ((SHOULD_REDACT)); then
+      printf '%s%s%s%s%s<unterminated multiline secret hidden>%s\n' \
+        "$multiline_prefix" "$multiline_key" "$multiline_separator" \
+        "$multiline_leading" "$multiline_quote" "$multiline_quote"
+    else
+      print_buffer "${buffer[@]}"
+    fi
+  fi
+}
+
+files=()
+while (($#)); do
+  case "$1" in
+    -k|--keep)
+      (($# >= 2)) || die "$1 requires a value"
+      KEEP="$2"
+      shift 2
+      ;;
+    --keep=*) KEEP="${1#*=}"; shift ;;
+    -m|--mask)
+      (($# >= 2)) || die "$1 requires a value"
+      MASK="$2"
+      shift 2
+      ;;
+    --mask=*) MASK="${1#*=}"; shift ;;
+    --labels)
+      (($# >= 2)) || die "$1 requires a value"
+      LABELS="$2"
+      shift 2
+      ;;
+    --labels=*) LABELS="${1#*=}"; shift ;;
+    --public-labels)
+      (($# >= 2)) || die "$1 requires a value"
+      PUBLIC_LABELS="$2"
+      shift 2
+      ;;
+    --public-labels=*) PUBLIC_LABELS="${1#*=}"; shift ;;
+    --key-regex)
+      (($# >= 2)) || die "$1 requires a value"
+      KEY_REGEX="$2"
+      shift 2
+      ;;
+    --key-regex=*) KEY_REGEX="${1#*=}"; shift ;;
+    --no-auto|--only-marked) AUTO_DETECT=0; shift ;;
+    --auto) AUTO_DETECT=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -v|--version) printf 'env-shadow %s\n' "$VERSION"; exit 0 ;;
+    --) shift; files+=("$@"); break ;;
+    -) files+=("-"); shift ;;
+    -*) die "unknown option: $1" ;;
+    *) files+=("$1"); shift ;;
+  esac
+done
+
+is_nonnegative_integer "$KEEP" || die "--keep must be a non-negative integer"
+is_nonnegative_integer "$AUTO_DETECT" || die "ENV_SHADOW_AUTO must be 0 or 1"
+((AUTO_DETECT == 0 || AUTO_DETECT == 1)) || die "ENV_SHADOW_AUTO must be 0 or 1"
+
+if ((${#files[@]} == 0)); then
+  process_stream
+else
+  status=0
+  for file in "${files[@]}"; do
+    if [[ "$file" == '-' ]]; then
+      process_stream
+    elif [[ ! -r "$file" ]]; then
+      printf 'env-shadow: %s: cannot read file\n' "$file" >&2
+      status=1
+    else
+      process_stream < "$file"
+    fi
+  done
+  exit "$status"
+fi
